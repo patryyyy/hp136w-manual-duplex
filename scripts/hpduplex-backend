@@ -1,0 +1,85 @@
+#!/bin/sh
+# CUPS backend for the "HP136wManualDuplex" virtual queue.
+# CUPS runs backends as _lp, so this script only spools the PDF and exits.
+# The user-level LaunchAgent runs `hpduplex watch`, which prints fronts,
+# shows the flip dialog, and prints backs as the logged-in user.
+
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+LOG=/Users/Shared/HP136wDuplex/logs/backend.log
+
+log() {
+  printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG" 2>/dev/null
+}
+
+JOB_ID="${1:-unknown}"
+CUPS_USER="${2:-unknown}"
+TITLE="${3:-}"
+COPIES="${4:-1}"
+OPTIONS="${5:-}"
+FILE="${6:-}"
+
+SPOOL=/Users/Shared/HP136wDuplex/spool
+
+if [ ! -d "$SPOOL" ]; then
+  log "job $JOB_ID: spool missing: $SPOOL"
+  echo "ERROR: hpduplex spool missing" >&2
+  exit 1
+fi
+
+TMP=$(mktemp -t hpduplex-cups) || {
+  log "job $JOB_ID: mktemp failed"
+  exit 1
+}
+trap 'rm -f "$TMP"' EXIT INT TERM
+
+if [ -n "$FILE" ] && [ -f "$FILE" ]; then
+  cp "$FILE" "$TMP" || {
+    log "job $JOB_ID: copy failed"
+    exit 1
+  }
+else
+  cat > "$TMP" || {
+    log "job $JOB_ID: stdin read failed"
+    exit 1
+  }
+fi
+chmod 644 "$TMP"
+
+MAGIC=$(head -c 4 "$TMP" 2>/dev/null)
+if [ "$MAGIC" != "%PDF" ]; then
+  log "job $JOB_ID: not a PDF (magic=$MAGIC)"
+  echo "ERROR: hpduplex backend expects PDF" >&2
+  exit 1
+fi
+
+COPIES_ARG=1
+if [ -n "$OPTIONS" ]; then
+  PARSED=$(printf '%s\n' "$OPTIONS" | sed -n 's/.*copies=\([0-9][0-9]*\).*/\1/p')
+  if [ -n "$PARSED" ]; then
+    COPIES_ARG="$PARSED"
+  fi
+fi
+if [ "$COPIES_ARG" -lt 1 ] 2>/dev/null; then COPIES_ARG=1; fi
+if [ "$COPIES_ARG" -gt 50 ] 2>/dev/null; then COPIES_ARG=50; fi
+
+SAFE_JOB=$(printf '%s' "$JOB_ID" | tr -c 'A-Za-z0-9._-' '_')
+NAME="job-${SAFE_JOB}-c${COPIES_ARG}-$(date +%s)-$$.pdf"
+DEST="$SPOOL/$NAME"
+TMPNAME="$SPOOL/.tmp-$NAME"
+
+if ! cp "$TMP" "$TMPNAME" 2>/dev/null; then
+  log "job $JOB_ID: cannot write spool $TMPNAME"
+  echo "ERROR: hpduplex cannot write spool" >&2
+  exit 1
+fi
+chmod 644 "$TMPNAME"
+
+if ! mv "$TMPNAME" "$DEST" 2>/dev/null; then
+  log "job $JOB_ID: cannot rename spool file"
+  rm -f "$TMPNAME"
+  echo "ERROR: hpduplex cannot finalize spool file" >&2
+  exit 1
+fi
+
+log "job $JOB_ID: queued $DEST (cups_user=$CUPS_USER copies=$COPIES_ARG title=$TITLE)"
+exit 0
